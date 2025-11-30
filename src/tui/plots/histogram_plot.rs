@@ -4,7 +4,7 @@ use ratatui::{
     text::Line,
     widgets::{Bar, BarChart, BarGroup, Clear, StatefulWidget, Widget},
 };
-use tui_scrollview::{ScrollView, ScrollViewState, ScrollbarVisibility};
+use tui_widgets::scrollview::{ScrollView, ScrollViewState, ScrollbarVisibility};
 
 use crate::{misc::globals::theme, tui::widgets::block::Block};
 
