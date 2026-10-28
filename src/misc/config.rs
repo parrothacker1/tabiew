@@ -10,7 +10,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AppResult, misc::paths::config_path, net::http::HttpConfig, tui::themes::theme::LoadedTheme,
+    AppResult, duckdb::DuckDBConfig, misc::paths::config_path, net::http::HttpConfig,
+    tui::themes::theme::LoadedTheme,
 };
 
 use super::unwrap_or_graceful_shutdown::UnwrapOrGracefulShutdown;
@@ -20,6 +21,7 @@ use super::unwrap_or_graceful_shutdown::UnwrapOrGracefulShutdown;
 pub struct Config {
     theme: RwLock<LoadedTheme>,
     http: RwLock<HttpConfig>,
+    duckdb: RwLock<DuckDBConfig>,
     show_table_row_numbers: AtomicBool,
     use_nerd_font: AtomicBool,
     fp_precision: AtomicI8,
@@ -32,12 +34,14 @@ impl Config {
         let Config {
             theme,
             http,
+            duckdb,
             show_table_row_numbers: table_row_numbers,
             use_nerd_font: nerd_font,
             fp_precision,
         } = toml::from_str(&contents)?;
         self.set_theme(theme.into_inner()?);
         self.set_http_config(http.into_inner()?);
+        self.set_duckdb_config(duckdb.into_inner()?);
         self.show_table_row_numbers
             .swap(table_row_numbers.into_inner(), Ordering::Relaxed);
         self.use_nerd_font
@@ -70,6 +74,14 @@ impl Config {
 
     pub fn set_http_config(&self, http_config: impl Into<HttpConfig>) {
         *self.http.write().unwrap_or_graceful_shutdown() = http_config.into();
+    }
+
+    pub fn duckdb_config(&self) -> impl Deref<Target = DuckDBConfig> {
+        self.duckdb.read().unwrap_or_graceful_shutdown()
+    }
+
+    pub fn set_duckdb_config(&self, duckdb_config: impl Into<DuckDBConfig>) {
+        *self.duckdb.write().unwrap_or_graceful_shutdown() = duckdb_config.into()
     }
 
     pub fn fp_precision(&self) -> Option<usize> {
@@ -108,6 +120,7 @@ impl Default for Config {
             show_table_row_numbers: AtomicBool::new(true),
             use_nerd_font: AtomicBool::new(false),
             http: RwLock::new(HttpConfig::default()),
+            duckdb: RwLock::new(DuckDBConfig::default()),
             fp_precision: AtomicI8::new(-1),
         }
     }
