@@ -240,3 +240,267 @@ fn delete_files(files: &[CacheEntry]) {
         let _ = delete_file(&entry.path);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::duckdb::DuckDBConfig;
+    use std::{
+        fs::{self, FileTimes},
+        time::Duration,
+    };
+    use tempfile::TempDir;
+
+    fn config(
+        dir: &TempDir,
+        max_cache_size: Option<ByteSize>,
+        lru_capacity: Option<usize>,
+    ) -> DuckDBConfig {
+        DuckDBConfig {
+            cache_dir: dir.path().join("cache"),
+            max_cache_size,
+            lru_capacity,
+            ..DuckDBConfig::default()
+        }
+    }
+
+    fn manager(config: &DuckDBConfig) -> CacheManager {
+        CacheManager::new(
+            &config.cache_dir,
+            config.max_cache_size,
+            config.lru_capacity.unwrap_or(0),
+        )
+        .unwrap()
+    }
+
+    fn source(dir: &TempDir, name: &str, size: usize) -> PathBuf {
+        let path = dir.path().join(name);
+        fs::write(&path, vec![b'x'; size]).unwrap();
+        path
+    }
+
+    fn fill_db(db_path: &Path, size: usize) {
+        fs::write(db_path, vec![0u8; size]).unwrap();
+    }
+
+    fn set_accessed_age(path: &Path, age_secs: u64) {
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(
+                FileTimes::new().set_accessed(SystemTime::now() - Duration::from_secs(age_secs)),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn new_creates_missing_cache_dir() {
+        let dir = TempDir::new().unwrap();
+        let config = config(&dir, None, None);
+        assert!(!config.cache_dir.exists());
+        manager(&config);
+        assert!(config.cache_dir.is_dir());
+    }
+
+    #[test]
+    fn miss_then_create_then_hit() {
+        let dir = TempDir::new().unwrap();
+        let config = config(&dir, None, None);
+        let mut cm = manager(&config);
+        let src = source(&dir, "data.csv", 10);
+        assert_eq!(cm.check_existing_cache_db(&src).unwrap(), None);
+        let db = cm.create_new_db(&src).unwrap();
+        assert_eq!(db.parent().unwrap(), config.cache_dir);
+        let name = db.file_name().unwrap().to_str().unwrap();
+        assert_eq!(name.len(), 64 + ".duckdb".len());
+        assert!(name[..64].chars().all(|c| c.is_ascii_hexdigit()));
+        fill_db(&db, 10);
+        assert_eq!(cm.check_existing_cache_db(&src).unwrap(), Some(db));
+    }
+
+    #[test]
+    fn modified_source_misses_cache() {
+        let dir = TempDir::new().unwrap();
+        let mut cm = manager(&config(&dir, None, None));
+        let src = source(&dir, "data.csv", 10);
+        fill_db(&cm.create_new_db(&src).unwrap(), 10);
+        File::options()
+            .write(true)
+            .open(&src)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000))
+            .unwrap();
+        assert_eq!(cm.check_existing_cache_db(&src).unwrap(), None);
+    }
+
+    #[test]
+    fn delete_db_removes_db_and_wal() {
+        let dir = TempDir::new().unwrap();
+        let mut cm = manager(&config(&dir, None, None));
+        let src = source(&dir, "data.csv", 10);
+        let db = cm.create_new_db(&src).unwrap();
+        fill_db(&db, 10);
+        let wal = db.with_extension("duckdb.wal");
+        fs::write(&wal, "wal").unwrap();
+        cm.delete_db(&src).unwrap();
+        assert!(!db.exists());
+        assert!(!wal.exists());
+        assert_eq!(cm.check_existing_cache_db(&src).unwrap(), None);
+    }
+
+    #[test]
+    fn new_keeps_most_recently_accessed_within_capacity() {
+        let dir = TempDir::new().unwrap();
+        let config = config(&dir, None, Some(2));
+        fs::create_dir_all(&config.cache_dir).unwrap();
+        let old = config.cache_dir.join("old.duckdb");
+        let mid = config.cache_dir.join("mid.duckdb");
+        let new = config.cache_dir.join("new.duckdb");
+        for (path, age) in [(&old, 300), (&mid, 200), (&new, 100)] {
+            fill_db(path, 10);
+            set_accessed_age(path, age);
+        }
+        let notes = config.cache_dir.join("notes.txt");
+        fs::write(&notes, "keep me").unwrap();
+        let subdir = config.cache_dir.join("sub.duckdb");
+        fs::create_dir(&subdir).unwrap();
+        manager(&config);
+        assert!(!old.exists());
+        assert!(mid.exists() && new.exists());
+        assert!(notes.exists() && subdir.is_dir());
+    }
+
+    #[test]
+    fn new_keeps_most_recently_accessed_within_max_cache_size() {
+        let dir = TempDir::new().unwrap();
+        let config = config(&dir, Some(ByteSize(25)), None);
+        fs::create_dir_all(&config.cache_dir).unwrap();
+        let old = config.cache_dir.join("old.duckdb");
+        let mid = config.cache_dir.join("mid.duckdb");
+        let new = config.cache_dir.join("new.duckdb");
+        for (path, age) in [(&old, 300), (&mid, 200), (&new, 100)] {
+            fill_db(path, 10);
+            set_accessed_age(path, age);
+        }
+        manager(&config);
+        assert!(!old.exists());
+        assert!(mid.exists() && new.exists());
+    }
+
+    #[test]
+    fn new_does_not_delete_db_in_use_by_another_instance() {
+        let dir = TempDir::new().unwrap();
+        let config = config(&dir, None, Some(1));
+        let mut other = manager(&config);
+        let src = source(&dir, "data.csv", 10);
+        let in_use = other.create_new_db(&src).unwrap();
+        fill_db(&in_use, 10);
+        set_accessed_age(&in_use, 300);
+        let newer = config.cache_dir.join("newer.duckdb");
+        fill_db(&newer, 10);
+        set_accessed_age(&newer, 100);
+        manager(&config);
+        assert!(in_use.exists());
+        assert!(newer.exists());
+    }
+
+    #[test]
+    fn create_over_capacity_evicts_least_recently_used() {
+        let dir = TempDir::new().unwrap();
+        let mut cm = manager(&config(&dir, None, Some(2)));
+        let (a, b, c) = (
+            source(&dir, "a.csv", 10),
+            source(&dir, "b.csv", 10),
+            source(&dir, "c.csv", 10),
+        );
+        let db_a = cm.create_new_db(&a).unwrap();
+        fill_db(&db_a, 10);
+        let db_b = cm.create_new_db(&b).unwrap();
+        fill_db(&db_b, 10);
+        assert_eq!(cm.check_existing_cache_db(&a).unwrap(), Some(db_a.clone()));
+        fill_db(&cm.create_new_db(&c).unwrap(), 10);
+        assert!(db_a.exists());
+        assert!(!db_b.exists());
+    }
+
+    #[test]
+    fn create_over_max_cache_size_evicts_least_recently_used() {
+        let dir = TempDir::new().unwrap();
+        let mut cm = manager(&config(&dir, Some(ByteSize(100)), None));
+        let (a, b, c) = (
+            source(&dir, "a.csv", 40),
+            source(&dir, "b.csv", 40),
+            source(&dir, "c.csv", 40),
+        );
+        let db_a = cm.create_new_db(&a).unwrap();
+        fill_db(&db_a, 40);
+        cm.release_db(&db_a);
+        let db_b = cm.create_new_db(&b).unwrap();
+        fill_db(&db_b, 40);
+        cm.release_db(&db_b);
+        cm.create_new_db(&c).unwrap();
+        assert!(!db_a.exists());
+        assert!(db_b.exists());
+    }
+
+    #[test]
+    fn create_rejects_source_bigger_than_max_cache_size() {
+        let dir = TempDir::new().unwrap();
+        let mut cm = manager(&config(&dir, Some(ByteSize(10)), None));
+        let src = source(&dir, "big.csv", 20);
+        assert!(cm.create_new_db(&src).is_err());
+    }
+
+    #[test]
+    fn eviction_skips_db_in_use_by_another_instance() {
+        let dir = TempDir::new().unwrap();
+        let config = config(&dir, Some(ByteSize(100)), None);
+        let mut cm = manager(&config);
+        let (a, b, c) = (
+            source(&dir, "a.csv", 40),
+            source(&dir, "b.csv", 40),
+            source(&dir, "c.csv", 40),
+        );
+        let db_a = cm.create_new_db(&a).unwrap();
+        fill_db(&db_a, 40);
+        cm.release_db(&db_a);
+        let db_b = cm.create_new_db(&b).unwrap();
+        fill_db(&db_b, 40);
+        cm.release_db(&db_b);
+        let mut other = manager(&config);
+        assert!(other.check_existing_cache_db(&a).unwrap().is_some());
+        cm.create_new_db(&c).unwrap();
+        assert!(db_a.exists());
+        assert!(!db_b.exists());
+    }
+
+    #[test]
+    fn eviction_errors_when_every_db_is_in_use_then_recovers_after_release() {
+        let dir = TempDir::new().unwrap();
+        let config = config(&dir, Some(ByteSize(100)), None);
+        let mut cm = manager(&config);
+        let (a, b, c) = (
+            source(&dir, "a.csv", 40),
+            source(&dir, "b.csv", 40),
+            source(&dir, "c.csv", 40),
+        );
+        let db_a = cm.create_new_db(&a).unwrap();
+        fill_db(&db_a, 40);
+        cm.release_db(&db_a);
+        let db_b = cm.create_new_db(&b).unwrap();
+        fill_db(&db_b, 40);
+        cm.release_db(&db_b);
+        let mut other = manager(&config);
+        other.check_existing_cache_db(&a).unwrap();
+        other.check_existing_cache_db(&b).unwrap();
+        let err = cm.create_new_db(&c).unwrap_err();
+        assert!(err.to_string().contains("Can't allocate"), "{err}");
+        assert!(db_a.exists() && db_b.exists());
+        other.release_db(&db_a);
+        other.release_db(&db_b);
+        cm.create_new_db(&c).unwrap();
+        assert!(!db_a.exists());
+        assert!(db_b.exists());
+    }
+}
