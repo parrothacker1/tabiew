@@ -8,19 +8,19 @@ use serde::{Deserialize, Serialize};
 #[serde(default)]
 pub struct Config {
     /// alloted ram for the duckdb to work with.
-    allotted_ram: Option<ByteSize>,
+    pub allotted_ram: Option<ByteSize>,
 
     /// the directory in which the cache files will be generated and stored.
-    cache_dir: PathBuf,
+    pub cache_dir: PathBuf,
 
     /// the maximum cache size.
     /// the system will try to do a LRU eviction on the files based on the age.
     /// if the file goes beyond the given limit then it will show an error
-    max_cache_size: Option<ByteSize>,
+    pub max_cache_size: Option<ByteSize>,
 
     /// the capacity for the lru cache
     /// if all the files can't fit in this the rest of the files will be deleted
-    lru_capacity: Option<usize>,
+    pub lru_capacity: Option<usize>,
 }
 
 impl Default for Config {

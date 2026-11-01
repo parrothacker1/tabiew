@@ -4,6 +4,7 @@ use bytesize::ByteSize;
 use lru::LruCache;
 use sha2::{Digest, Sha256};
 use std::{
+    fs::File,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     time::SystemTime,
@@ -12,7 +13,7 @@ use std::{
 pub struct CacheManager {
     cache_dir: PathBuf,
     cache_size: Option<ByteSize>,
-    lru_file_cache: LruCache<PathBuf, SystemTime>,
+    lru_file_cache: LruCache<PathBuf, Option<File>>,
 }
 
 impl CacheManager {
@@ -21,8 +22,12 @@ impl CacheManager {
         cache_size: Option<ByteSize>,
         lru_capacity: usize,
     ) -> AppResult<Self> {
-        let mut lru_cache =
-            LruCache::<PathBuf, SystemTime>::new(NonZeroUsize::new(lru_capacity).unwrap());
+        let mut lru_cache: LruCache<PathBuf, Option<File>>;
+        if lru_capacity == 0 {
+            lru_cache = LruCache::unbounded();
+        } else {
+            lru_cache = LruCache::new(NonZeroUsize::new(lru_capacity).unwrap());
+        }
         build_db_lru(&mut lru_cache, cache_dir.as_ref(), cache_size)?;
         Ok(Self {
             cache_dir: cache_dir.as_ref().to_path_buf(),
@@ -35,30 +40,36 @@ impl CacheManager {
             self.lru_cache_eviction(file_path)?;
         }
         let duckdb_file_name = hash_file_path(&self.cache_dir, file_path)?;
-        if let Some((evicted_file, _)) = self
-            .lru_file_cache
-            .push(duckdb_file_name.to_path_buf(), SystemTime::now())
-            && evicted_file != duckdb_file_name
-        {
-            let _ = delete_file(&evicted_file);
-        }
+        let lock = lock_db(&duckdb_file_name)?;
+        self.track(&duckdb_file_name, lock);
         Ok(duckdb_file_name)
     }
-    /// `Ok(None)` when the file isn't cached.
     pub fn check_existing_cache_db(&mut self, file_path: &Path) -> AppResult<Option<PathBuf>> {
         let hashed_file = hash_file_path(&self.cache_dir, file_path)?;
+        if self
+            .lru_file_cache
+            .peek(&hashed_file)
+            .is_some_and(Option::is_some)
+        {
+            self.lru_file_cache.promote(&hashed_file);
+            return Ok(Some(hashed_file));
+        }
+        let lock = lock_db(&hashed_file)?;
         if !std::fs::exists(&hashed_file).map_err(|e| anyhow!(e))? {
             return Ok(None);
         }
-        self.lru_file_cache
-            .push(hashed_file.clone(), SystemTime::now());
+        self.track(&hashed_file, lock);
         Ok(Some(hashed_file))
     }
     pub fn delete_db(&mut self, file_path: &Path) -> AppResult<()> {
         let hashed_file = hash_file_path(&self.cache_dir, file_path)?;
-        delete_file(&hashed_file)?;
-        let _ = self.lru_file_cache.pop(&hashed_file);
-        Ok(())
+        self.lru_file_cache.pop(&hashed_file);
+        delete_file(&hashed_file)
+    }
+    pub fn release_db(&mut self, file_path: &Path) {
+        if let Some(lock) = self.lru_file_cache.peek_mut(file_path) {
+            *lock = None;
+        }
     }
     fn lru_cache_eviction(&mut self, file_path: &Path) -> AppResult<()> {
         let file_size = ByteSize(
@@ -71,16 +82,31 @@ impl CacheManager {
             if file_size >= cache_size {
                 return Err(anyhow!("File size is bigger than the cache size"));
             }
-            while cache_size
-                .as_u64()
-                .saturating_sub(self.current_cache_usage()?.as_u64())
-                < file_size.as_u64()
-                && let Some((evicted, _)) = self.lru_file_cache.pop_lru()
-            {
-                if delete_file(&evicted).is_err() {
-                    break;
+            let mut in_use = Vec::new();
+            let result = loop {
+                let free_space = match self.current_cache_usage() {
+                    Ok(usage) => cache_size.as_u64().saturating_sub(usage.as_u64()),
+                    Err(e) => break Err(e),
+                };
+                if free_space >= file_size.as_u64() {
+                    break Ok(());
                 }
+                let Some((evicted, lock)) = self.lru_file_cache.pop_lru() else {
+                    break Err(anyhow!(
+                        "Can't allocate {} in the cache, the remaining cached files are in use",
+                        file_size
+                    ));
+                };
+                drop(lock);
+                if delete_file(&evicted).is_err() {
+                    in_use.push(evicted);
+                }
+            };
+            for path in in_use.into_iter().rev() {
+                self.lru_file_cache.push(path.clone(), None);
+                self.lru_file_cache.demote(&path);
             }
+            return result;
         }
         Ok(())
     }
@@ -97,16 +123,37 @@ impl CacheManager {
         }
         Ok(ByteSize(total))
     }
+    fn track(&mut self, file_path: &Path, lock: File) {
+        if let Some((evicted, evicted_lock)) = self
+            .lru_file_cache
+            .push(file_path.to_path_buf(), Some(lock))
+            && evicted != file_path
+        {
+            drop(evicted_lock);
+            let _ = delete_file(&evicted);
+        }
+    }
+}
+
+fn lock_db(file_path: &Path) -> AppResult<File> {
+    let lock = File::create(file_path.with_extension("duckdb.lock"))?;
+    lock.lock_shared()?;
+    Ok(lock)
 }
 
 fn delete_file(file_path: &Path) -> AppResult<()> {
+    let file_lock = std::fs::File::create(&file_path.with_extension("duckdb.lock"))?;
+    if let Err(std::fs::TryLockError::WouldBlock) = file_lock.try_lock() {
+        return Err(anyhow!("File {:?} is in use", file_path));
+    }
     std::fs::remove_file(file_path)
         .map_err(|e| anyhow!("Failed to delete file {:?}: {}", file_path, e))?;
-    let wal_path = file_path.with_extension("duckdb.wal");
-    match std::fs::remove_file(&wal_path) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-            Err(anyhow!("Failed to delete file {:?}: {}", wal_path, e))
-        }
+    match std::fs::remove_file(file_path.with_extension("duckdb.wal")) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(anyhow!(
+            "Failed to delete file {:?}: {}",
+            file_path.with_extension("duckdb.wal"),
+            e
+        )),
         _ => Ok(()),
     }
 }
@@ -134,9 +181,8 @@ struct CacheEntry {
     accessed: SystemTime,
 }
 
-// TODO: what if some other tabiew instance is reading a duckdb file and this tries to delete it ?
 fn build_db_lru(
-    cache: &mut LruCache<PathBuf, SystemTime>,
+    cache: &mut LruCache<PathBuf, Option<File>>,
     cache_dir: &Path,
     cache_size: Option<ByteSize>,
 ) -> AppResult<()> {
@@ -183,7 +229,7 @@ fn build_db_lru(
         delete_index += 1;
     }
     for entry in sorted_entries[..delete_index].iter().rev() {
-        cache.push(entry.path.clone(), entry.accessed);
+        cache.push(entry.path.clone(), None);
     }
     delete_files(&sorted_entries[delete_index..]);
     Ok(())
