@@ -1,5 +1,6 @@
 mod cache;
 mod config;
+mod file_db;
 mod connection;
 pub mod reader;
 
