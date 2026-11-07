@@ -1,6 +1,9 @@
 use crate::{
     AppResult,
-    duckdb::{file_db::FileDB, helper::quote},
+    duckdb::{
+        file_db::{FileDB, FileDBMetadata},
+        helper::quote,
+    },
     iters::enumerate_names,
 };
 use anyhow::anyhow;
@@ -80,20 +83,26 @@ impl Session {
             .and_then(|file_db| file_db.file_path().file_stem())
             .map(|stem| stem.to_string_lossy().into_owned());
         let name = self.available_name(table_name.or(stem.as_deref()).unwrap_or("table"));
-        let (table, source) = match file_db {
+        let (table, source, read_only) = match file_db {
             Some(file_db) => {
                 let source = file_db.file_path().to_string_lossy().into_owned();
-                (Table::File(file_db), source)
+                let table_complete = FileDBMetadata::is_complete(file_db.file_path());
+                (Table::File(file_db), source, table_complete)
             }
             None => (
                 Table::Memory(format!("mem_{name}")),
                 String::from(":memory:"),
+                false,
             ),
         };
-        self.conn.execute(
-            &format!("ATTACH IF NOT EXISTS ? AS {}", quote(&table.alias())),
-            params![source],
-        )?;
+        let alias = table.alias();
+        if !self.name_map.values().any(|t| t.alias() == alias) {
+            let options = if read_only { " (READ_ONLY)" } else { "" };
+            self.conn.execute(
+                &format!("ATTACH IF NOT EXISTS ? AS {}{options}", quote(&alias)),
+                params![source],
+            )?;
+        }
         self.name_map.insert(name.clone(), table);
         Ok(Some(name))
     }
@@ -172,7 +181,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::duckdb::ingester::Ingester;
+    use crate::duckdb::{file_db::FileDBStatus, ingester::Ingester};
     use std::path::Path;
     use tempfile::TempDir;
 
@@ -182,7 +191,7 @@ mod tests {
     }
 
     fn is_locked(db: &Path) -> bool {
-        FileDB::try_exclusive_lock(db).unwrap().is_none()
+        FileDB::new(db).is_err() || FileDB::new(db).unwrap().get_write_lock().is_err()
     }
 
     fn count(session: &Session, table: &str) -> i64 {
@@ -304,6 +313,37 @@ mod tests {
             .unwrap()
             .get_write_lock()
             .unwrap();
+    }
+
+    #[test]
+    fn complete_db_attaches_read_only() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("abc.duckdb");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE data (id INT)").unwrap();
+        drop(conn);
+        let mut meta = FileDBMetadata::new(Path::new("/data/sales.csv"));
+        meta.status = FileDBStatus::Complete;
+        meta.write(&db).unwrap();
+        let mut session = Session::new(None).unwrap();
+        attach_file(&mut session, "one", &db);
+        let write = session.session().unwrap().execute_batch("DROP TABLE abc.data");
+        assert!(write.is_err());
+    }
+
+    #[test]
+    fn reopening_a_file_imported_in_this_session_reuses_the_attach() {
+        let dir = TempDir::new().unwrap();
+        let db = dir.path().join("abc.duckdb");
+        let mut session = Session::new(None).unwrap();
+        attach_file(&mut session, "one", &db);
+        ingest(&mut session, "one");
+        let mut meta = FileDBMetadata::new(Path::new("/data/sales.csv"));
+        meta.status = FileDBStatus::Complete;
+        meta.write(&db).unwrap();
+        attach_file(&mut session, "two", &db);
+        session.create_view("two").unwrap();
+        assert_eq!(count(&session, "two"), 10);
     }
 
     #[test]

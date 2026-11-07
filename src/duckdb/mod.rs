@@ -1,16 +1,15 @@
 mod cache;
 mod config;
 mod file_db;
+mod helper;
 mod ingester;
 pub mod reader;
 mod session;
-mod helper;
 
 use cache::CacheManager;
 use config::Config;
 use session::Session;
 
-pub use cache::{CacheMetadata, CacheStatus};
 pub use config::Config as DuckDBConfig;
 
 pub struct DuckDB {
@@ -21,4 +20,5 @@ pub struct DuckDB {
 
 impl DuckDB {
     pub fn new() {}
+    pub fn flush() {}
 }
